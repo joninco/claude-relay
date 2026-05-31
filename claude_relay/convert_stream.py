@@ -96,6 +96,8 @@ async def convert_openai_stream_to_anthropic(
     result: StreamResult | None = None,
     req_id: str = "",
     input_tokens: int = 0,
+    emit_thinking: bool = False,
+    skip_message_start: bool = False,
 ) -> AsyncIterator[bytes]:
     """Consume OpenAI SSE events and yield Anthropic SSE bytes.
 
@@ -106,6 +108,11 @@ async def convert_openai_stream_to_anthropic(
         result: Optional mutable container; block_index is set after streaming ends.
         req_id: Request ID for log correlation.
         input_tokens: Input token count for message_start.
+        emit_thinking: If True, convert backend reasoning deltas to Anthropic
+            thinking blocks. Keep this False unless the client requested
+            Anthropic extended thinking.
+        skip_message_start: If True, omit only message_start (message_stop still sent).
+            Used when message_start was already emitted during peek phase.
     """
     _r = f"[{req_id}] " if req_id else ""
     message_id = _make_message_id()
@@ -158,7 +165,7 @@ async def convert_openai_stream_to_anthropic(
         if "model" in data and model == "unknown":
             model = data["model"]
             log.info("%sconvert_stream: model=%s", _r, model)
-            if not skip_message_wrapper:
+            if not skip_message_wrapper and not skip_message_start:
                 yield _build_message_start(message_id, model, input_tokens=input_tokens)
 
         choices = data.get("choices")
@@ -187,26 +194,27 @@ async def convert_openai_stream_to_anthropic(
 
         if reasoning:
             thinking_chars += len(reasoning)
-            if not thinking_started:
-                thinking_started = True
-                current_index = block_index
-                block_index += 1
-                open_blocks.add(current_index)
-                log.info("%sconvert_stream: thinking block START idx=%d", _r, current_index)
-                yield _build_content_block_start(current_index, {
-                    "type": "thinking",
-                    "thinking": "",
+            if emit_thinking:
+                if not thinking_started:
+                    thinking_started = True
+                    current_index = block_index
+                    block_index += 1
+                    open_blocks.add(current_index)
+                    log.info("%sconvert_stream: thinking block START idx=%d", _r, current_index)
+                    yield _build_content_block_start(current_index, {
+                        "type": "thinking",
+                        "thinking": "",
+                    })
+                yield _build_content_block_delta(current_index, {
+                    "type": "thinking_delta",
+                    "thinking": reasoning,
                 })
-            yield _build_content_block_delta(current_index, {
-                "type": "thinking_delta",
-                "thinking": reasoning,
-            })
 
         # --- Thinking signature ---
         thinking_obj = delta.get("thinking")
         if isinstance(thinking_obj, dict) and "signature" in thinking_obj:
             sig = thinking_obj["signature"]
-            if sig and current_index >= 0 and thinking_started:
+            if emit_thinking and sig and current_index >= 0 and thinking_started:
                 log.info("%sconvert_stream: signature_delta len=%d", _r, len(sig))
                 yield _build_content_block_delta(current_index, {
                     "type": "signature_delta",
@@ -330,8 +338,8 @@ async def convert_openai_stream_to_anthropic(
         log.info("%sconvert_stream: closing final block idx=%d", _r, idx)
         yield _stop_block(idx)
 
-    log.info("%sconvert_stream: end events=%d thinking=%d text=%d tools=%d stop=%s",
-             _r, event_count, thinking_chars, text_chars, len(tool_call_blocks), pending_stop_reason)
+    log.info("%sconvert_stream: end events=%d thinking=%d emit_thinking=%s text=%d tools=%d stop=%s",
+             _r, event_count, thinking_chars, emit_thinking, text_chars, len(tool_call_blocks), pending_stop_reason)
     if pending_stop_reason == "tool_use" and not tool_call_blocks:
         log.error("%sconvert_stream: stop_reason=tool_use with zero converted tool_use blocks; downgrading to end_turn", _r)
         pending_stop_reason = "end_turn"

@@ -19,8 +19,33 @@ async def fake_events(data_chunks: list[str]):
 
 
 @pytest.mark.asyncio
-async def test_glm_reasoning_field_maps_to_thinking_block():
+async def test_glm_reasoning_field_maps_to_thinking_block_when_enabled():
     """GLM/vLLM streams reasoning as delta.reasoning, not reasoning_content."""
+    events = fake_events([
+        '{"model":"test"}',
+        '{"choices":[{"delta":{"reasoning":"think"},"finish_reason":null}]}',
+        '{"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}',
+        '{"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        '[DONE]',
+    ])
+    result = StreamResult()
+    chunks = [
+        c async for c in convert_openai_stream_to_anthropic(
+            events, result=result, emit_thinking=True,
+        )
+    ]
+    output = b"".join(chunks).decode()
+
+    assert '"type": "thinking"' in output
+    assert '"thinking": "think"' in output
+    assert output.count("event: content_block_start") == 2
+    assert output.count("event: content_block_stop") == 2
+    assert result.stop_reason == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_is_suppressed_when_thinking_not_enabled():
+    """Do not emit Anthropic thinking blocks unless the client requested them."""
     events = fake_events([
         '{"model":"test"}',
         '{"choices":[{"delta":{"reasoning":"think"},"finish_reason":null}]}',
@@ -32,10 +57,12 @@ async def test_glm_reasoning_field_maps_to_thinking_block():
     chunks = [c async for c in convert_openai_stream_to_anthropic(events, result=result)]
     output = b"".join(chunks).decode()
 
-    assert '"type": "thinking"' in output
-    assert '"thinking": "think"' in output
-    assert output.count("event: content_block_start") == 2
-    assert output.count("event: content_block_stop") == 2
+    assert '"type": "thinking"' not in output
+    assert '"thinking": "think"' not in output
+    assert '"type": "text"' in output
+    assert '"text": "Hello"' in output
+    assert output.count("event: content_block_start") == 1
+    assert output.count("event: content_block_stop") == 1
     assert result.stop_reason == "end_turn"
 
 
@@ -70,7 +97,11 @@ async def test_thinking_text_tool_interleave():
         '[DONE]',
     ])
     result = StreamResult()
-    chunks = [c async for c in convert_openai_stream_to_anthropic(events, result=result)]
+    chunks = [
+        c async for c in convert_openai_stream_to_anthropic(
+            events, result=result, emit_thinking=True,
+        )
+    ]
     output = b"".join(chunks).decode()
 
     # Should have: thinking block, text block, tool block
@@ -164,7 +195,11 @@ async def test_thinking_then_text_closes_both():
         '[DONE]',
     ])
     result = StreamResult()
-    chunks = [c async for c in convert_openai_stream_to_anthropic(events, result=result)]
+    chunks = [
+        c async for c in convert_openai_stream_to_anthropic(
+            events, result=result, emit_thinking=True,
+        )
+    ]
     output = b"".join(chunks).decode()
 
     assert output.count("event: content_block_start") == 2
@@ -182,7 +217,11 @@ async def test_thinking_only_closes_block():
         '[DONE]',
     ])
     result = StreamResult()
-    chunks = [c async for c in convert_openai_stream_to_anthropic(events, result=result)]
+    chunks = [
+        c async for c in convert_openai_stream_to_anthropic(
+            events, result=result, emit_thinking=True,
+        )
+    ]
     output = b"".join(chunks).decode()
 
     assert output.count("event: content_block_start") == 1
@@ -205,6 +244,7 @@ async def test_skip_message_wrapper_balances_blocks():
     chunks = [
         c async for c in convert_openai_stream_to_anthropic(
             events, index_offset=5, skip_message_wrapper=True, result=result,
+            emit_thinking=True,
         )
     ]
     output = b"".join(chunks).decode()
