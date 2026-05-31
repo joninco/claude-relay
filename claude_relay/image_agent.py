@@ -10,7 +10,7 @@ from typing import AsyncIterator
 
 import aiohttp
 
-from .config import ProxyConfig
+from .config import BackendTarget, ProxyConfig
 from .convert_request import _make_data_url
 from .convert_stream import (
     StreamResult,
@@ -239,6 +239,8 @@ async def image_agent_stream(
     config: ProxyConfig,
     image_cache: ImageCache,
     req_id: str = "",
+    emit_thinking: bool = False,
+    backend_target: BackendTarget | None = None,
 ) -> AsyncIterator[bytes]:
     """Stream the first response, intercept analyzeImage tool_use, call vision, stitch follow-up.
 
@@ -309,6 +311,7 @@ async def image_agent_stream(
         skip_message_wrapper=True,
         result=result,
         req_id=req_id,
+        emit_thinking=emit_thinking,
     ):
         yield chunk
 
@@ -442,7 +445,13 @@ async def image_agent_stream(
 
     # Phase 4: Send follow-up to text model
     log.info("%simage_agent: Phase 4 — sending follow-up to backend", _r)
-    followup_resp = await send_to_backend(session, config, followup_body, req_id=req_id)
+    followup_resp = await send_to_backend(
+        session,
+        config,
+        followup_body,
+        req_id=req_id,
+        backend_target=backend_target,
+    )
     log.info("%simage_agent: Phase 4 DONE — follow-up status=%d", _r, followup_resp.status)
 
     if followup_resp.status != 200:
@@ -463,6 +472,7 @@ async def image_agent_stream(
         skip_message_wrapper=True,
         result=followup_result,
         req_id=req_id,
+        emit_thinking=emit_thinking,
     ):
         yield chunk
 
