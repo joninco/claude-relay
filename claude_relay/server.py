@@ -1,5 +1,7 @@
 """aiohttp server: POST /v1/messages handler."""
 
+import asyncio
+import errno
 import json
 import os
 import logging
@@ -16,8 +18,8 @@ DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
 from .config import ProxyConfig
 from .convert_request import convert_request
 from .convert_stream import StreamResult, convert_openai_stream_to_anthropic
-from .sse import SSEEvent, parse_sse_stream
-from .backend import send_to_backend, detect_backend, get_state
+from .sse import SSEEvent, make_anthropic_sse, parse_sse_stream
+from .backend import send_to_backend, detect_backend, get_state, get_states_info
 from .image_agent import has_images, strip_and_cache_images, image_agent_stream, ImageCache
 from .normalize import normalize_request
 
@@ -30,6 +32,7 @@ class ContextOverflowRetry:
     ctx_limit: int
     input_tokens: int | None
     reason: str
+    input_tokens_is_lower_bound: bool = False
 
 
 def _summarize_messages(messages: list) -> str:
@@ -118,9 +121,34 @@ def _parse_token_count(value: str) -> int:
     return int(value.replace(",", ""))
 
 
-def _completion_token_margin(num_messages: int, num_tools: int) -> int:
-    """Estimate backend chat-template overhead not captured by local token counting."""
-    return 128 + (2 * num_messages) + (20 * num_tools)
+class ContextWindowError(ValueError):
+    """Raised when input tokens alone exceed the context window."""
+
+
+_CONTEXT_RETRY_MARGIN = 100
+_CONTEXT_LOWER_BOUND_RETRY_MARGIN = 1024
+
+
+def _context_retry_completion_budget(
+    ctx_limit: int,
+    input_tokens: int | None,
+    config: ProxyConfig,
+    *,
+    input_tokens_is_lower_bound: bool = False,
+) -> int:
+    # vLLM's "prompt contains at least ..." count is a lower bound observed at
+    # overflow, not a stable exact prompt token count. Use a larger reserve for
+    # that form so retries do not chase a moving one-token-over boundary.
+    margin = _CONTEXT_LOWER_BOUND_RETRY_MARGIN if input_tokens_is_lower_bound else _CONTEXT_RETRY_MARGIN
+    available_tokens = ctx_limit - margin
+    if input_tokens is not None:
+        available_tokens -= input_tokens
+    return max(config.min_completion_tokens, available_tokens)
+
+
+def _completion_token_margin(local_input_tokens: int) -> int:
+    """Small fixed reserve. The 400-retry path corrects precisely when tiktoken underestimates."""
+    return 128
 
 
 def _cap_max_completion_tokens(
@@ -128,13 +156,16 @@ def _cap_max_completion_tokens(
     *,
     ctx_limit: int,
     input_tokens: int,
-    num_messages: int,
-    num_tools: int,
-    config: ProxyConfig,
 ) -> tuple[int, int]:
-    margin = _completion_token_margin(num_messages, num_tools)
-    capped_max = max(config.min_completion_tokens, ctx_limit - input_tokens - margin)
-    return min(requested_max, capped_max), margin
+    margin = _completion_token_margin(input_tokens)
+    available = ctx_limit - input_tokens - margin
+    if available <= 0:
+        raise ContextWindowError(
+            f"Input exceeds context window: input_tokens={input_tokens}, "
+            f"ctx_limit={ctx_limit}, margin={margin}"
+        )
+    capped = min(requested_max, available)
+    return capped, margin
 
 
 def _context_overflow_retry_from_error(
@@ -150,11 +181,8 @@ def _context_overflow_retry_from_error(
     match = re.search(r"max_completion_tokens\s*=\s*([\d,]+).*?max_model_len\D*([\d,]+)", error_body, flags)
     if match:
         ctx_limit = _parse_token_count(match.group(2))
-        available_tokens = ctx_limit - 100
-        if estimated_input_tokens is not None:
-            available_tokens -= estimated_input_tokens
         return ContextOverflowRetry(
-            max_completion_tokens=max(config.min_completion_tokens, available_tokens),
+            max_completion_tokens=_context_retry_completion_budget(ctx_limit, estimated_input_tokens, config),
             ctx_limit=ctx_limit,
             input_tokens=estimated_input_tokens,
             reason="completion_limit",
@@ -165,10 +193,27 @@ def _context_overflow_retry_from_error(
     match = re.search(
         r"maximum context length is\s*([\d,]+).*?"
         r"requested\s*([\d,]+)\s*output tokens.*?"
-        r"prompt contains(?:\s+at least)?\s*([\d,]+)\s*input tokens",
+        r"prompt contains(?P<lower_bound>\s+at least)?\s*([\d,]+)\s*input tokens",
         error_body,
         flags,
     )
+    if match:
+        ctx_limit = _parse_token_count(match.group(1))
+        input_tokens = _parse_token_count(match.group(4))
+        input_tokens_is_lower_bound = bool(match.group("lower_bound"))
+        return ContextOverflowRetry(
+            max_completion_tokens=_context_retry_completion_budget(
+                ctx_limit,
+                input_tokens,
+                config,
+                input_tokens_is_lower_bound=input_tokens_is_lower_bound,
+            ),
+            ctx_limit=ctx_limit,
+            input_tokens=input_tokens,
+            reason="context_limit",
+            input_tokens_is_lower_bound=input_tokens_is_lower_bound,
+        )
+
     if not match:
         # OpenAI-compatible/SGLang shape:
         # "maximum context length is X tokens. However, you requested Y tokens (Z in the messages, W in the completion)."
@@ -179,18 +224,233 @@ def _context_overflow_retry_from_error(
             error_body,
             flags,
         )
+    if not match:
+        # vLLM/SGLang newer shape:
+        # "Requested token count exceeds the model's maximum context length of X tokens.
+        #  You requested a total of Y tokens: Z tokens from the input messages and W tokens for the completion."
+        match = re.search(
+            r"maximum context length of\s*([\d,]+)\s*tokens.*?"
+            r"requested a total of\s*([\d,]+)\s*tokens.*?"
+            r"([\d,]+)\s*tokens from (?:the )?(?:input messages|messages|prompt).*?"
+            r"([\d,]+)\s*tokens for (?:the )?(?:completion|output)",
+            error_body,
+            flags,
+        )
 
     if match:
         ctx_limit = _parse_token_count(match.group(1))
         input_tokens = _parse_token_count(match.group(3))
         return ContextOverflowRetry(
-            max_completion_tokens=max(config.min_completion_tokens, ctx_limit - input_tokens - 100),
+            max_completion_tokens=_context_retry_completion_budget(ctx_limit, input_tokens, config),
             ctx_limit=ctx_limit,
             input_tokens=input_tokens,
             reason="context_limit",
         )
 
     return None
+
+
+_DISCONNECT_EXC = (ConnectionResetError, aiohttp.ClientConnectionResetError, BrokenPipeError)
+
+KEEPALIVE_INTERVAL = 5  # seconds between SSE keepalive comments
+
+_EMPTY_RESPONSE_RETRY_PROMPT = (
+    "The previous assistant completion ended without visible assistant text or "
+    "a tool call. Continue the current task now. If hidden thinking is open, "
+    "close the thinking block before the final answer. Put the final "
+    "user-facing answer in normal visible assistant content, not hidden "
+    "reasoning. If a tool is needed, call a tool instead."
+)
+
+
+class _ClientGone(Exception):
+    """Raised when a keepalive write fails because the client disconnected."""
+
+
+class _ResponseDumper:
+    """Best-effort dump of bytes sent to the Anthropic client."""
+
+    def __init__(self, req_id: str, enabled: bool):
+        self.req_id = req_id
+        self.path: str | None = None
+        self._file = None
+        if not enabled:
+            return
+
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        self.path = os.path.join(DEBUG_DIR, f"{req_id}_anthropic_stream.sse")
+        try:
+            self._file = open(self.path, "wb")
+            log.info("[%s] response_dump: dumping Anthropic SSE to %s", req_id, self.path)
+        except OSError as exc:
+            log.warning("[%s] response_dump: failed to open %s: %s", req_id, self.path, exc)
+            self.path = None
+
+    def write(self, chunk: bytes) -> None:
+        if self._file is None:
+            return
+        try:
+            self._file.write(chunk)
+            self._file.flush()
+        except OSError as exc:
+            log.warning("[%s] response_dump: failed to write %s: %s", self.req_id, self.path, exc)
+            self.close()
+
+    def close(self) -> None:
+        if self._file is None:
+            return
+        try:
+            self._file.close()
+        except OSError:
+            pass
+        finally:
+            self._file = None
+
+
+def _is_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, _DISCONNECT_EXC):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in {
+        errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED,
+    }:
+        return True
+    return "closing transport" in str(exc).lower()
+
+
+async def _send_keepalive(
+    response: web.StreamResponse,
+    response_dump: _ResponseDumper | None = None,
+) -> None:
+    """Send an SSE comment keepalive. Raises _ClientGone if client disconnected."""
+    chunk = b": keepalive\n\n"
+    try:
+        await response.write(chunk)
+        if response_dump is not None:
+            response_dump.write(chunk)
+    except _DISCONNECT_EXC as exc:
+        raise _ClientGone from exc
+
+
+async def _emit_sse_error(
+    response: web.StreamResponse,
+    error_type: str,
+    message: str,
+    response_dump: _ResponseDumper | None = None,
+) -> None:
+    """Emit an SSE error event and close the stream. For post-prepare error paths."""
+    payload = json.dumps({"type": "error", "error": {"type": error_type, "message": message}})
+    chunk = f"event: error\ndata: {payload}\n\n".encode()
+    try:
+        await response.write(chunk)
+        if response_dump is not None:
+            response_dump.write(chunk)
+    except _DISCONNECT_EXC:
+        pass
+    try:
+        await response.write_eof()
+    except (RuntimeError, *_DISCONNECT_EXC):
+        pass
+
+
+async def _prepare_stream_response(request: web.Request) -> web.StreamResponse | None:
+    """Create and prepare a StreamResponse. Returns None if client already disconnected."""
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    try:
+        await response.prepare(request)
+    except _DISCONNECT_EXC:
+        log.warning("Client disconnected before stream prepare")
+        return None
+    return response
+
+
+def _delta_has_visible_output(delta: dict) -> bool:
+    """Return True when an OpenAI delta contains user-visible output."""
+    content = delta.get("content")
+    if isinstance(content, str):
+        if content.strip():
+            return True
+    elif content:
+        return True
+
+    if delta.get("tool_calls"):
+        return True
+
+    return False
+
+
+def _append_empty_response_retry_instruction(openai_body: dict) -> None:
+    messages = openai_body.setdefault("messages", [])
+    if messages and messages[-1].get("content") == _EMPTY_RESPONSE_RETRY_PROMPT:
+        return
+    messages.append({"role": "user", "content": _EMPTY_RESPONSE_RETRY_PROMPT})
+
+
+async def _peek_with_keepalive(
+    sse_events: AsyncIterator[SSEEvent],
+    response: web.StreamResponse,
+    response_dump: _ResponseDumper | None = None,
+    interval: int = KEEPALIVE_INTERVAL,
+) -> tuple[list[SSEEvent], bool]:
+    """Buffer SSE events until first client-visible output or [DONE], sending keepalives during waits.
+
+    Returns (buffered_events, has_visible_output).
+    Raises _ClientGone if the client disconnects during peek.
+    """
+    buffered = []
+    has_visible_output = False
+    ait = sse_events.__aiter__()
+    pending = asyncio.ensure_future(ait.__anext__())
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                await _send_keepalive(response, response_dump)
+                continue
+
+            try:
+                event = pending.result()
+            except StopAsyncIteration:
+                break
+            except Exception as exc:
+                # Backend-read exception — don't conflate with client disconnect.
+                # Let the caller decide how to handle backend failures.
+                log.exception("Error while peeking SSE stream")
+                raise
+
+            buffered.append(event)
+            if event.data == "[DONE]":
+                break
+
+            try:
+                data = json.loads(event.data)
+                choices = data.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    if _delta_has_visible_output(delta):
+                        has_visible_output = True
+                        break
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            pending = asyncio.ensure_future(ait.__anext__())
+    finally:
+        if not pending.done():
+            pending.cancel()
+        try:
+            await pending
+        except (StopAsyncIteration, asyncio.CancelledError, Exception):
+            pass
+
+    return buffered, has_visible_output
 
 
 def _tool_state_summary(tool_states: dict[str, dict]) -> list[dict]:
@@ -459,7 +719,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         len(b.get("text", "")) for b in body.get("system", []) if isinstance(b, dict)
     )
     thinking = body.get("thinking", {})
-    thinking_info = f"budget={thinking.get('budget_tokens')}" if thinking.get("type") == "enabled" else "off"
+    thinking_enabled = isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive")
+    thinking_info = f"budget={thinking.get('budget_tokens')}" if thinking_enabled else "off"
 
     log.info(
         "[%s] >>> POST /v1/messages msgs=%d tools=%d(%s) system=%d thinking=%s image_agent=%s",
@@ -498,6 +759,16 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     openai_msgs = openai_body.get("messages", [])
     openai_tool_names = _openai_tool_names(openai_body.get("tools", []))
     tool_debug_enabled = config.tool_debug and bool(openai_tool_names)
+    backend_target = config.resolve_backend(str(openai_body.get("model") or "auto"))
+    state = await detect_backend(session, backend_target.backend_url)
+    log.info(
+        "[%s]     route: model=%s -> backend=%s route=%s upstream_model=%s",
+        req_id,
+        backend_target.request_model,
+        backend_target.backend_url,
+        backend_target.route_name,
+        backend_target.upstream_model or state.model,
+    )
     log.info("[%s]     openai: %d msgs, model=%s, max_tokens=%s, tools=%d tool_choice=%s",
              req_id, len(openai_msgs), openai_body.get("model"),
              openai_body.get("max_completion_tokens"),
@@ -521,38 +792,49 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         except Exception as e:
             log.warning("[%s]     failed to dump openai body: %s", req_id, e)
 
-    # Count input tokens via tiktoken for message_start
+    # Count input tokens via tiktoken for capping and message_start
     input_token_count = len(_get_tiktoken().encode(_serialize_for_counting(body)))
-    state = get_state()
     requested_max = openai_body.get("max_completion_tokens")
     if isinstance(requested_max, int) and requested_max > 0:
-        capped_max, margin = _cap_max_completion_tokens(
-            requested_max,
-            ctx_limit=state.context_limit,
-            input_tokens=input_token_count,
-            num_messages=len(openai_msgs),
-            num_tools=len(openai_tool_names),
-            config=config,
-        )
+        try:
+            capped_max, margin = _cap_max_completion_tokens(
+                requested_max,
+                ctx_limit=state.context_limit,
+                input_tokens=input_token_count,
+            )
+        except ContextWindowError as exc:
+            log.error("[%s] Context window exceeded: %s", req_id, exc)
+            return web.json_response(
+                {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}},
+                status=400,
+            )
         if capped_max < requested_max:
             log.warning(
                 "[%s] Capping max_completion_tokens %d → %d (input≈%d, limit=%d, margin=%d)",
-                req_id,
-                requested_max,
-                capped_max,
-                input_token_count,
-                state.context_limit,
-                margin,
+                req_id, requested_max, capped_max, input_token_count, state.context_limit, margin,
             )
             openai_body["max_completion_tokens"] = capped_max
 
     # Send main streaming request to backend (with auto-retry on context overflow)
     max_retries = 2
+    response = None  # Track prepared StreamResponse across retries
+    response_dump: _ResponseDumper | None = None
     for attempt in range(max_retries + 1):
         try:
-            resp = await send_to_backend(session, config, openai_body, req_id=req_id)
+            resp = await send_to_backend(
+                session,
+                config,
+                openai_body,
+                req_id=req_id,
+                backend_target=backend_target,
+            )
         except Exception as e:
             log.error("[%s] Backend request failed: %s", req_id, e)
+            if response is not None:
+                await _emit_sse_error(response, "api_error", str(e), response_dump)
+                if response_dump is not None:
+                    response_dump.close()
+                return response
             return web.json_response(
                 {"type": "error", "error": {"type": "api_error", "message": str(e)}},
                 status=502,
@@ -564,16 +846,27 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
             retry = _context_overflow_retry_from_error(error_body, config, input_token_count)
             if retry is not None and attempt < max_retries:
+                if retry.input_tokens is not None and retry.input_tokens > 0:
+                    delta = retry.input_tokens - input_token_count
+                    log.warning("[%s] Tokenizer delta: vLLM=%d, tiktoken=%d, delta=%d (%.1f%%)",
+                                req_id, retry.input_tokens, input_token_count, delta,
+                                (delta / input_token_count * 100) if input_token_count > 0 else 0)
                 if retry.reason == "completion_limit":
                     log.warning("[%s] max_completion_tokens exceeds model limit: input≈%d, limit=%d → retrying with max_completion_tokens=%d (attempt %d)",
                                 req_id, retry.input_tokens or 0, retry.ctx_limit, retry.max_completion_tokens, attempt + 1)
                 else:
-                    log.warning("[%s] Context overflow on non-200: input=%d, limit=%d → retrying with max_completion_tokens=%d (attempt %d)",
-                                req_id, retry.input_tokens, retry.ctx_limit, retry.max_completion_tokens, attempt + 1)
+                    input_note = "at least " if retry.input_tokens_is_lower_bound else ""
+                    log.warning("[%s] Context overflow on non-200: input=%s%s, limit=%d → retrying with max_completion_tokens=%d (attempt %d)",
+                                req_id, input_note, retry.input_tokens, retry.ctx_limit, retry.max_completion_tokens, attempt + 1)
                 resp.close()
                 openai_body["max_completion_tokens"] = retry.max_completion_tokens
                 continue
 
+            if response is not None:
+                await _emit_sse_error(response, "api_error", error_body, response_dump)
+                if response_dump is not None:
+                    response_dump.close()
+                return response
             return web.json_response(
                 {"type": "error", "error": {"type": "api_error", "message": error_body}},
                 status=resp.status,
@@ -581,35 +874,90 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
         log.info("[%s]     backend responded 200, streaming...", req_id)
 
-        # For non-image-agent: peek at first SSE events to detect errors/empty responses
+        # Prepare the stream response immediately so the client gets 200 OK
+        # headers without waiting for vLLM prefill. This prevents Claude Code's
+        # internal retry logic from firing during long prefill latencies.
+        # On context-overflow retry, reuse the already-prepared response
+        # since only invisible SSE comments have been sent.
         if not use_image_agent:
+            if response is None:
+                response = await _prepare_stream_response(request)
+                if response is None:
+                    log.warning("[%s] Client disconnected before stream start", req_id)
+                    resp.close()
+                    return web.Response(status=499)
+                response_dump = _ResponseDumper(req_id, config.dump_responses)
+
+            try:
+                await _send_keepalive(response, response_dump)
+            except _ClientGone:
+                log.warning("[%s] Client disconnected after prepare", req_id)
+                resp.close()
+                if response_dump is not None:
+                    response_dump.close()
+                return response
+
+            # Emit message_start immediately so client sees input token count
+            # and shows progress during prefill, instead of "initializing..."
+            # until the first reasoning token arrives.
+            if not getattr(response, "_relay_msg_start_sent", False):
+                msg_start = make_anthropic_sse("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": f"msg_{os.urandom(12).hex()}",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": state.model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": input_token_count,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                            "output_tokens": 0,
+                        },
+                    },
+                })
+                await response.write(msg_start)
+                if response_dump is not None:
+                    response_dump.write(msg_start)
+                response._relay_msg_start_sent = True
+
+            # Peek at SSE events with keepalive comments during waits.
+            # This detects empty/error/context-overflow responses before
+            # emitting any Anthropic message events to the client.
             sse_events = _debug_sse_stream(
                 parse_sse_stream(resp),
                 req_id,
                 enabled=tool_debug_enabled,
                 expected_tool_names=openai_tool_names,
             )
-            buffered = []
-            has_content = False
-            async for event in sse_events:
-                buffered.append(event)
-                if event.data == "[DONE]":
-                    break
-                try:
-                    data = json.loads(event.data)
-                    choices = data.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        if delta:
-                            has_content = True
-                            break
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            try:
+                buffered, has_content = await _peek_with_keepalive(
+                    sse_events,
+                    response,
+                    response_dump,
+                )
+            except _ClientGone:
+                log.warning("[%s] Client disconnected during peek", req_id)
+                resp.close()
+                if response_dump is not None:
+                    response_dump.close()
+                return response
+            except Exception as exc:
+                # Backend-read or parser error — not a client disconnect.
+                log.error("[%s] Error peeking SSE stream: %s", req_id, exc)
+                resp.close()
+                await _emit_sse_error(response, "api_error", f"Backend stream error: {exc}", response_dump)
+                if response_dump is not None:
+                    response_dump.close()
+                return response
 
             if not has_content:
                 # Check if backend returned a context-overflow error
                 error_msg = "Backend returned empty response"
-                context_overflow = False
+                retry = None
                 for ev in buffered:
                     if ev.data == "[DONE]":
                         continue
@@ -617,32 +965,44 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                         ev_data = json.loads(ev.data)
                         if "error" in ev_data:
                             error_msg = ev_data["error"].get("message", str(ev_data["error"]))
-                            m = re.search(r"(\d+) tokens from the input.*?(\d+) tokens for the completion", error_msg)
-                            if m:
-                                context_overflow = True
-                                input_tokens = int(m.group(1))
-                                m2 = re.search(r"maximum context length of (\d+)", error_msg)
-                                ctx_limit = int(m2.group(1)) if m2 else get_state().context_limit
+                            retry = _context_overflow_retry_from_error(error_msg, config, input_token_count)
+                            if retry is not None:
                                 break
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-                if context_overflow and attempt < max_retries:
-                    new_max = max(config.min_completion_tokens, ctx_limit - input_tokens - 100)
-                    log.warning("[%s] Context overflow: input=%d, limit=%d → retrying with max_completion_tokens=%d (attempt %d)",
-                                req_id, input_tokens, ctx_limit, new_max, attempt + 1)
-                    openai_body["max_completion_tokens"] = new_max
+                if retry is not None and attempt < max_retries:
+                    input_note = "at least " if retry.input_tokens_is_lower_bound else ""
+                    log.warning("[%s] Context overflow: input=%s%s, limit=%d → retrying with max_completion_tokens=%d (attempt %d)",
+                                req_id, input_note, retry.input_tokens, retry.ctx_limit,
+                                retry.max_completion_tokens, attempt + 1)
+                    resp.close()
+                    openai_body["max_completion_tokens"] = retry.max_completion_tokens
+                    # Only SSE comments have been sent so far — the client
+                    # has received zero semantic events. We can transparently
+                    # retry by re-entering the loop and reusing this same
+                    # prepared StreamResponse (skip prepare on retry).
+                    continue
+
+                if attempt < max_retries:
+                    log.warning(
+                        "[%s] Backend returned no visible output/tool call; retrying with continuation instruction (attempt %d)",
+                        req_id,
+                        attempt + 1,
+                    )
+                    resp.close()
+                    _append_empty_response_retry_instruction(openai_body)
                     continue
 
                 log.error("[%s] EMPTY/ERROR response from backend — got %d events, error: %s",
                           req_id, len(buffered), error_msg)
                 for i, ev in enumerate(buffered):
                     log.error("[%s]   event[%d]: %s", req_id, i, ev.data[:500])
-                return web.json_response(
-                    {"type": "error", "error": {"type": "overloaded_error",
-                     "message": error_msg}},
-                    status=529,
-                )
+
+                await _emit_sse_error(response, "overloaded_error", error_msg, response_dump)
+                if response_dump is not None:
+                    response_dump.close()
+                return response
 
             async def _replay_and_continue():
                 for ev in buffered:
@@ -653,38 +1013,84 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             sse_source = _replay_and_continue()
         else:
             sse_source = None
+            # Image agent path: prepare response the same way
+            response = await _prepare_stream_response(request)
+            if response is None:
+                log.warning("[%s] Client disconnected before stream start", req_id)
+                resp.close()
+                return web.Response(status=499)
+            response_dump = _ResponseDumper(req_id, config.dump_responses)
+            try:
+                await _send_keepalive(response, response_dump)
+            except _ClientGone:
+                log.warning("[%s] Client disconnected after prepare", req_id)
+                resp.close()
+                if response_dump is not None:
+                    response_dump.close()
+                return response
 
         break  # success
 
-    response = web.StreamResponse(
-        status=200,
-        headers={
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
-    )
-    await response.prepare(request)
-
     bytes_sent = 0
+    client_gone = False
+    backend_error = False
     try:
         if use_image_agent:
-            async for chunk in image_agent_stream(resp, openai_body, session_id, session, config, request.app["image_cache"], req_id):
-                await response.write(chunk)
-                bytes_sent += len(chunk)
+            chunk_iter = image_agent_stream(
+                resp,
+                openai_body,
+                session_id,
+                session,
+                config,
+                request.app["image_cache"],
+                req_id,
+                emit_thinking=thinking_enabled,
+                backend_target=backend_target,
+            )
         else:
-            async for chunk in convert_openai_stream_to_anthropic(sse_source, req_id=req_id, input_tokens=input_token_count):
+            chunk_iter = convert_openai_stream_to_anthropic(
+                sse_source,
+                req_id=req_id,
+                input_tokens=input_token_count,
+                emit_thinking=thinking_enabled,
+                skip_message_start=getattr(response, "_relay_msg_start_sent", False),
+            )
+        async for chunk in chunk_iter:
+            # Backend-read errors surface from the async for; client-write
+            # errors surface from response.write(). Separate the scopes.
+            try:
                 await response.write(chunk)
-                bytes_sent += len(chunk)
+                if response_dump is not None:
+                    response_dump.write(chunk)
+            except _DISCONNECT_EXC:
+                client_gone = True
+                log.warning("[%s] Client disconnected during streaming", req_id)
+                break
+            except _ClientGone:
+                client_gone = True
+                log.warning("[%s] Client disconnected during streaming", req_id)
+                break
+            bytes_sent += len(chunk)
+    except _DISCONNECT_EXC as e:
+        # This comes from the async iterator — it's a backend-read error,
+        # not a client disconnect. The client is still connected.
+        backend_error = True
+        log.error("[%s] Backend stream read error: %s", req_id, e)
     except Exception as e:
-        err_str = str(e).lower()
-        if "closing transport" in err_str or "connection reset" in err_str:
-            log.warning("[%s] Client disconnected during streaming: %s", req_id, e)
-        else:
-            log.error("[%s] Streaming error: %s", req_id, e, exc_info=True)
+        # Backend-read or converter error.
+        backend_error = True
+        log.error("[%s] Streaming error: %s", req_id, e, exc_info=True)
 
     log.info("[%s] <<< done, %d bytes sent", req_id, bytes_sent)
-    await response.write_eof()
+    if backend_error and not client_gone:
+        await _emit_sse_error(response, "api_error", "Backend stream error", response_dump)
+    elif not client_gone:
+        try:
+            await response.write_eof()
+        except (RuntimeError, *_DISCONNECT_EXC) as e:
+            log.warning("[%s] Client disconnected before EOF: %s", req_id, e)
+    if response_dump is not None:
+        response_dump.close()
     return response
 
 
@@ -775,6 +1181,14 @@ async def health_check(request: web.Request) -> web.Response:
     return web.json_response({
         **state.info(),
         "backend_url": config.backend_url,
+        "backends": get_states_info(),
+        "model_routes": {
+            name: {
+                "backend_url": route.backend_url,
+                "upstream_model": route.upstream_model,
+            }
+            for name, route in config.model_routes.items()
+        },
         "image_agent_enabled": config.image_agent_enabled,
         "vision_url": config.vision_url,
         "vision_model": config.vision_model,
@@ -792,7 +1206,7 @@ def _cleanup_debug_files(max_age_hours: int) -> int:
         return 0
 
     for fname in os.listdir(DEBUG_DIR):
-        if not fname.endswith((".json", ".ndjson")):
+        if not fname.endswith((".json", ".ndjson", ".sse")):
             continue
         fpath = os.path.join(DEBUG_DIR, fname)
         try:
@@ -811,7 +1225,7 @@ async def on_startup(app: web.Application):
     config: ProxyConfig = app["config"]
     app["image_cache"] = ImageCache(config.image_cache_max_size, config.image_cache_ttl)
 
-    if config.dump_requests or config.tool_debug:
+    if config.dump_requests or config.dump_responses or config.tool_debug:
         os.makedirs(DEBUG_DIR, exist_ok=True)
 
     # Cleanup old debug files before starting
@@ -820,7 +1234,8 @@ async def on_startup(app: web.Application):
         if deleted > 0:
             log.info("Cleaned up %d old debug file(s) from %s", deleted, DEBUG_DIR)
 
-    await detect_backend(app["session"], config.backend_url)
+    for backend_url in config.backend_urls():
+        await detect_backend(app["session"], backend_url)
 
 
 async def on_cleanup(app: web.Application):
