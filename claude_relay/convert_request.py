@@ -2,6 +2,7 @@
 
 import json
 import logging
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,8 @@ def _convert_system(system) -> list[dict]:
             if isinstance(block, str):
                 parts.append({"type": "text", "text": block})
             elif isinstance(block, dict) and block.get("type") == "text":
-                part = {"type": "text", "text": block["text"]}
+                text = block.get("text", "")
+                part = {"type": "text", "text": text if isinstance(text, str) else str(text)}
                 if "cache_control" in block:
                     part["cache_control"] = block["cache_control"]
                 parts.append(part)
@@ -192,13 +194,19 @@ def _convert_thinking(thinking: dict) -> dict:
         effort = "low"
     elif budget <= 20000:
         effort = "medium"
-    else:
+    elif budget <= 50000:
         effort = "high"
+    else:
+        effort = "max"
 
     return {
         "reasoning": {"effort": effort, "enabled": True, "max_tokens": budget},
         "enable_thinking": True,
-        "chat_template_kwargs": {"enable_thinking": True, "clear_thinking": False},
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "clear_thinking": False,
+            "reasoning_effort": effort,
+        },
     }
 
 
@@ -221,8 +229,73 @@ def _convert_tool_choice(tool_choice: dict):
     return None
 
 
+def _content_to_blocks(content: Any) -> list[Any]:
+    """Canonicalize system content into a list of text blocks.
+
+    vLLM-style helper: strings become [{\"type\": \"text\", \"text\": s}],
+    lists pass through, None yields empty list.
+    """
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": str(content)}]
+
+
+def _normalize_system_messages(body: dict) -> dict:
+    """Normalize newer Claude Code format where system content appears in messages[].
+
+    Newer Claude Code sends role: \"system\" entries inside the messages array.
+    Extract those and canonically merge into the top-level system field.
+    Mirrors vLLM PR#44048 normalization logic.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    system_content = []
+    normalized = []
+    changed = False
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            normalized.append(msg)
+            continue
+        if msg.get("role") == "system":
+            system_content.append(msg.get("content"))
+            changed = True
+            continue
+        normalized.append(msg)
+
+    if not changed:
+        return body
+
+    # Canonicalize everything to flat block list
+    all_blocks = []
+    existing = body.get("system")
+    if existing is not None:
+        all_blocks.extend(_content_to_blocks(existing))
+    for sc in system_content:
+        all_blocks.extend(_content_to_blocks(sc))
+
+    # Collapse pure-text blocks to single string for OpenAI compat.
+    # Only when no block carries extra metadata (cache_control, etc).
+    if all(isinstance(b, dict) and set(b.keys()) <= {"type", "text"} and b.get("type") == "text" for b in all_blocks):
+        merged = "".join(str(b.get("text", "")) for b in all_blocks)
+    else:
+        merged = all_blocks
+
+    result = dict(body)
+    result["messages"] = normalized
+    result["system"] = merged
+    return result
+
+
 def convert_request(body: dict) -> dict:
     """Convert a full Anthropic /v1/messages request body to OpenAI /v1/chat/completions format."""
+    body = _normalize_system_messages(body)
     messages = []
 
     # System prompt
@@ -263,10 +336,27 @@ def convert_request(body: dict) -> dict:
     if "stop_sequences" in body:
         openai_body["stop"] = body["stop_sequences"]
 
-    # Extended thinking
+    # Extended thinking (budget_tokens path)
     thinking = body.get("thinking")
     if thinking and thinking.get("type") == "enabled":
         thinking_params = _convert_thinking(thinking)
         openai_body.update(thinking_params)
+        openai_body["_thinking_active"] = True
+
+    # Output config (effort level, used by Claude Code /effort command)
+    # Maps to vLLM reasoning_effort for DeepSeek chat template support.
+    # Only applied when thinking is active (adaptive or enabled).
+    output_config = body.get("output_config")
+    thinking_active = isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive")
+    if output_config and thinking_active and not (thinking and thinking.get("type") == "enabled"):
+        effort = output_config.get("effort")
+        if effort in ("low", "medium", "high", "max", "xhigh"):
+            kwargs = openai_body.setdefault("chat_template_kwargs", {})
+            kwargs["reasoning_effort"] = effort
+            kwargs["enable_thinking"] = True
+
+    # Signal to backend.py: client has thinking enabled (so route reasoning_effort defaults apply)
+    if thinking_active:
+        openai_body["_thinking_active"] = True
 
     return openai_body
