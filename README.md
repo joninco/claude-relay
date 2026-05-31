@@ -43,7 +43,9 @@ Usage: python -m claude_relay [OPTIONS]
 Server:
   --host HOST               Listen address (default: 0.0.0.0)
   --port PORT               Listen port (default: 5021)
+  --config PATH             TOML config file
   --backend URL             sglang/vLLM backend URL (default: http://localhost:30000)
+  --model-route SPEC        Per-model backend route: MODEL=URL[,UPSTREAM_MODEL]
   --ttl SECONDS             Backend auto-detection cache TTL (default: 30)
   --log-level LEVEL         Logging level (default: INFO)
 
@@ -65,6 +67,45 @@ Diagnostics:
   --sock-read-timeout SEC   Max silent period between backend chunks
 ```
 
+## Model Routing
+
+By default every request goes to `--backend`, and the relay still probes that backend's `/v1/models` endpoint to find the actual upstream model name. To send specific client-facing model names to different backends, add model routes:
+
+```bash
+python -m claude_relay \
+  --backend http://localhost:8000 \
+  --model-route 'claude-3-5-sonnet-20241022=http://localhost:8000,Qwen3.5' \
+  --model-route 'claude-opus-*=http://localhost:8001,Kimi-K2.6'
+```
+
+Routes are matched against the incoming Anthropic `model` field. Exact matches win first; route names containing `*`, `?`, or `[` are treated as glob patterns. The optional `UPSTREAM_MODEL` overrides the model name sent to that backend. If omitted, the relay uses that backend's first `/v1/models` result, preserving the old behavior.
+
+You can also put routes in a TOML config file:
+
+```toml
+backend_url = "http://localhost:8000"
+backend_detect_ttl = 30
+tool_debug = true
+dump_requests = true
+dump_responses = true
+
+[model_routes."claude-3-5-sonnet-20241022"]
+backend_url = "http://localhost:8000"
+upstream_model = "Qwen3.5"
+
+[model_routes."claude-opus-*"]
+backend_url = "http://localhost:8001"
+upstream_model = "Kimi-K2.6"
+```
+
+Start it with:
+
+```bash
+python -m claude_relay --config ~/.config/claude-relay/config.toml
+```
+
+For compatibility with `resp2chat` naming, `[model_profiles]` is accepted as an alias for `[model_routes]` in this relay config.
+
 ## Tool calling diagnostics
 
 For GLM/vLLM tool-call issues, run the relay with request and tool debugging enabled:
@@ -73,6 +114,7 @@ For GLM/vLLM tool-call issues, run the relay with request and tool debugging ena
 python -m claude_relay \
   --backend http://localhost:8000 \
   --dump-requests \
+  --dump-responses \
   --tool-debug
 ```
 
@@ -87,6 +129,7 @@ Each tool request writes:
 
 - `*_anthropic.json` - the original Claude/Anthropic request
 - `*_openai.json` - the converted OpenAI-compatible request sent to vLLM/sglang
+- `*_anthropic_stream.sse` - exact Anthropic SSE bytes sent back to the client
 - `*_backend_stream.ndjson` - raw backend SSE chunks
 - `*_tool_debug.json` - parsed tool-call diagnostics, including `finish_reasons`, `delta_keys`, assembled tool arguments, and JSON validity
 
