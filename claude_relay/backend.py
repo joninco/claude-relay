@@ -13,9 +13,23 @@ log = logging.getLogger(__name__)
 DEFAULT_CONTEXT_LIMIT = 131072  # 128k fallback if backend doesn't report
 
 
+def _lookup_ci(mapping: dict, key: str | None):
+    """Case-insensitive dict lookup. Exact match wins, then case-folded."""
+    if not key:
+        return None
+    if key in mapping:
+        return mapping[key]
+    folded = key.lower()
+    for k, v in mapping.items():
+        if k.lower() == folded:
+            return v
+    return None
+
+
 class BackendState:
     def __init__(self, ttl: int = 30):
         self.model: str | None = None
+        self.models: list[str] = []  # all model ids the backend serves
         self.backend_type: str | None = None  # "sglang" or "vllm"
         self.context_limit: int = DEFAULT_CONTEXT_LIMIT
         self.last_check: float = 0
@@ -25,9 +39,21 @@ class BackendState:
     def stale(self) -> bool:
         return self.model is None or (time.time() - self.last_check) >= self.ttl
 
+    def resolve_model(self, requested: str | None) -> str | None:
+        """Match `requested` against served models case-insensitively, returning
+        the backend's own casing. Fall back to the first served model when there
+        is no match (e.g. a stale or wrong upstream_model in config)."""
+        if requested:
+            folded = requested.strip().lower()
+            for served in self.models:
+                if served.lower() == folded:
+                    return served
+        return self.model
+
     def info(self) -> dict:
         return {
             "model": self.model,
+            "models": list(self.models),
             "backend_type": self.backend_type,
             "context_limit": self.context_limit,
             "last_check_ago": f"{time.time() - self.last_check:.0f}s"
@@ -55,7 +81,13 @@ async def detect_backend(session: aiohttp.ClientSession, backend_url: str) -> Ba
             timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             data = await resp.json()
-            model_info = data["data"][0]
+            served = data.get("data") or []
+            valid = [m for m in served if isinstance(m, dict) and m.get("id")]
+            if not valid:
+                # Don't clobber cached state on an empty/garbage response.
+                raise ValueError(f"no models reported by {backend_url}")
+            state.models = [m["id"] for m in valid]
+            model_info = valid[0]
             state.model = model_info["id"]
             owned_by = model_info.get("owned_by", "").lower()
 
@@ -147,15 +179,26 @@ async def send_to_backend(
     state = await detect_backend(session, target.backend_url)
 
     backend_body = deepcopy(openai_body)
-    backend_body["model"] = target.upstream_model or state.model
+    # Match the requested upstream model against what the backend actually serves
+    # (case-insensitively), falling back to the first served model when there is
+    # no match. This tolerates casing drift and stale upstream_model config.
+    requested_model = target.upstream_model
+    resolved_model = state.resolve_model(requested_model)
+    if requested_model and (resolved_model or "").lower() != requested_model.strip().lower():
+        log.warning(
+            "%smodel %r not served by %s (serving: %s); falling back to %r",
+            _r, requested_model, target.backend_url,
+            ", ".join(state.models) or "?", resolved_model,
+        )
+    backend_body["model"] = resolved_model
 
-    # Apply per-model sampling defaults from detected upstream model name
+    # Apply per-model sampling defaults keyed by the model actually being sent.
     # Only fills params not already set by client (setdefault).
-    sampling = config.model_sampling.get(state.model)
+    sampling = _lookup_ci(config.model_sampling, resolved_model)
     if sampling:
         for k, v in sampling.items():
             backend_body.setdefault(k, v)
-        log.info("%ssampling: %s (detected model=%s)", _r, sampling, state.model)
+        log.info("%ssampling: %s (model=%s)", _r, sampling, resolved_model)
 
     # When thinking is active: use route/effort default. When inactive: send "none"
     # so vLLM skips reasoning compute entirely. This changes the prompt slightly
