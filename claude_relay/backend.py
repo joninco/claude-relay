@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import logging
 from copy import deepcopy
@@ -8,6 +9,9 @@ import aiohttp
 from .config import BackendTarget, ProxyConfig
 
 log = logging.getLogger(__name__)
+
+# Mirror server.DEBUG_DIR without importing server (server imports backend).
+DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
 
 
 DEFAULT_CONTEXT_LIMIT = 131072  # 128k fallback if backend doesn't report
@@ -24,6 +28,43 @@ def _lookup_ci(mapping: dict, key: str | None):
         if k.lower() == folded:
             return v
     return None
+
+
+def _template_family(resolved_model: str | None, target: BackendTarget) -> str:
+    """Which chat-template contract the backend speaks. An explicit route
+    `template_family` wins; otherwise sniff the model name.
+
+    The concretely resolved model is authoritative — a stale `upstream_model`
+    must not override it (else a Kimi-named-but-unserved route would push real
+    DeepSeek traffic through Kimi mutation). Only fall back to the configured
+    `upstream_model` when resolution is unavailable (probe failed ->
+    resolve_model returns "default"/empty). Defaults to "deepseek" (the
+    original behavior) for anything unrecognized."""
+    declared = (getattr(target, "template_family", "auto") or "auto").lower()
+    if declared in ("kimi", "deepseek"):
+        return declared
+    name = (resolved_model or "").strip()
+    if not name or name.lower() == "default":
+        name = getattr(target, "upstream_model", "") or ""
+    return "kimi" if "kimi" in name.lower() else "deepseek"
+
+
+def _kimi_reshape_reasoning(body: dict) -> None:
+    """Remap Anthropic nested thinking -> flat reasoning_content on prior
+    assistant turns so Kimi's `preserve_thinking` has reasoning to replay.
+    Kimi templates read `message.reasoning`/`reasoning_content` (a string),
+    not Anthropic's nested {"thinking": {"content", "signature"}}. Covers
+    tool-call turns (filters on role only). Always drops the nested thinking
+    dict (Kimi ignores it); a usable existing reasoning_content string wins."""
+    for msg in body.get("messages", []):
+        if msg.get("role") != "assistant":
+            continue
+        thinking = msg.pop("thinking", None)
+        existing = msg.get("reasoning_content")
+        if isinstance(existing, str) and existing.strip():
+            continue
+        if isinstance(thinking, dict) and thinking.get("content"):
+            msg["reasoning_content"] = thinking["content"]
 
 
 class BackendState:
@@ -204,18 +245,51 @@ async def send_to_backend(
     # so vLLM skips reasoning compute entirely. This changes the prompt slightly
     # (costing a KV cache refill on toggle) but avoids burning compute on hidden reasoning.
     thinking_active = backend_body.pop("_thinking_active", False)
-    re = target.reasoning_effort
+    family = _template_family(resolved_model, target)
     kwargs = backend_body.setdefault("chat_template_kwargs", {})
-    if thinking_active:
-        kwargs.setdefault("reasoning_effort", re or "max")
-        kwargs.setdefault("enable_thinking", True)
+    if family == "kimi":
+        # Kimi K2.6/K2.7 templates read `thinking` (bool) + `preserve_thinking`
+        # (bool), NOT the DeepSeek vars. Strip the DeepSeek keys and the
+        # conversion-only top-level fields Kimi ignores, then set Kimi's own.
+        for k in ("enable_thinking", "clear_thinking", "reasoning_effort"):
+            kwargs.pop(k, None)
+        backend_body.pop("reasoning", None)
+        backend_body.pop("enable_thinking", None)
+        # Always keep thinking ENABLED for Kimi. Setting thinking=false makes the
+        # vLLM kimi_k2 reasoning parser fall through to IdentityReasoningParser
+        # (pure passthrough); K2.7-Code keeps reasoning anyway, so its raw chain
+        # of thought plus a stray </think> token leak into `content`. With
+        # thinking=true the parser splits reasoning into delta.reasoning, and the
+        # server's `emit_thinking` flag (driven by the client's request) decides
+        # whether the client actually sees thinking blocks or they're dropped.
+        kwargs["thinking"] = True
+        kwargs["preserve_thinking"] = True           # replay prior reasoning; version-independent
+        _kimi_reshape_reasoning(backend_body)
+        log.info("%skimi thinking=True preserve_thinking=True (client_thinking=%s, route=%s, model=%s)",
+                 _r, thinking_active, target.route_name, resolved_model)
     else:
-        kwargs.setdefault("reasoning_effort", "none")
-    log.info("%sreasoning_effort: %s (route=%s, active=%s)", _r, kwargs["reasoning_effort"], target.route_name, thinking_active)
+        re = target.reasoning_effort
+        if thinking_active:
+            kwargs.setdefault("reasoning_effort", re or "max")
+            kwargs.setdefault("enable_thinking", True)
+        else:
+            kwargs.setdefault("reasoning_effort", "none")
+        log.info("%sreasoning_effort: %s (route=%s, active=%s)", _r, kwargs["reasoning_effort"], target.route_name, thinking_active)
 
     # Request usage stats in streaming mode so we can report token counts to Claude Code
     if backend_body.get("stream"):
         backend_body["stream_options"] = {"include_usage": True}
+
+    # Dump the POST-mutation backend body (the openai dump in server.py is taken
+    # before this function rewrites model/kwargs/messages, so it cannot show the
+    # transform). Reuses the dump_requests flag.
+    if config.dump_requests and req_id:
+        try:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            with open(os.path.join(DEBUG_DIR, f"{req_id}_backend_request.json"), "w") as f:
+                json.dump(backend_body, f, indent=2, ensure_ascii=False, default=str)
+        except Exception as e:
+            log.warning("%sfailed to dump backend request: %s", _r, e)
 
     url = f"{target.backend_url}/v1/chat/completions"
     num_msgs = len(backend_body.get("messages", []))

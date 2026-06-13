@@ -233,6 +233,25 @@ def test_no_output_config_no_chat_template_kwargs():
     assert "chat_template_kwargs" not in converted
 
 
+def _assistant_msg(converted):
+    return next(m for m in converted["messages"] if m.get("role") == "assistant")
+
+
+def test_single_thinking_block_preserved():
+    body = {"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "only step", "signature": "sig"},
+            {"type": "text", "text": "answer"},
+        ]},
+    ]}
+
+    msg = _assistant_msg(convert_request(body))
+
+    assert msg["thinking"] == {"content": "only step", "signature": "sig"}
+    assert msg["content"] == "answer"
+
+
 def test_tool_choice_any_converts_to_required():
     body = {
         "messages": [{"role": "user", "content": "Use a tool."}],

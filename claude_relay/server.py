@@ -371,8 +371,15 @@ async def _prepare_stream_response(request: web.Request) -> web.StreamResponse |
     return response
 
 
-def _delta_has_visible_output(delta: dict) -> bool:
-    """Return True when an OpenAI delta contains user-visible output."""
+def _delta_has_visible_output(delta: dict, count_reasoning: bool = False) -> bool:
+    """Return True when an OpenAI delta contains user-visible output.
+
+    When count_reasoning is set (the client requested extended thinking),
+    reasoning deltas count as visible: a thinking-only completion that hits
+    max_tokens is a valid response, not an empty one to retry. Kimi always
+    reasons, so without this a small-budget thinking request could be
+    misclassified as empty and retried into an error.
+    """
     content = delta.get("content")
     if isinstance(content, str):
         if content.strip():
@@ -382,6 +389,13 @@ def _delta_has_visible_output(delta: dict) -> bool:
 
     if delta.get("tool_calls"):
         return True
+
+    if count_reasoning:
+        if delta.get("reasoning_content") or delta.get("reasoning"):
+            return True
+        thinking_obj = delta.get("thinking")
+        if isinstance(thinking_obj, dict) and thinking_obj.get("content"):
+            return True
 
     return False
 
@@ -397,6 +411,7 @@ async def _peek_with_keepalive(
     sse_events: AsyncIterator[SSEEvent],
     response: web.StreamResponse,
     response_dump: _ResponseDumper | None = None,
+    count_reasoning: bool = False,
     interval: int = KEEPALIVE_INTERVAL,
 ) -> tuple[list[SSEEvent], bool]:
     """Buffer SSE events until first client-visible output or [DONE], sending keepalives during waits.
@@ -435,7 +450,7 @@ async def _peek_with_keepalive(
                 choices = data.get("choices", [])
                 if choices:
                     delta = choices[0].get("delta", {})
-                    if _delta_has_visible_output(delta):
+                    if _delta_has_visible_output(delta, count_reasoning):
                         has_visible_output = True
                         break
             except (json.JSONDecodeError, TypeError):
@@ -938,6 +953,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     sse_events,
                     response,
                     response_dump,
+                    count_reasoning=thinking_enabled,
                 )
             except _ClientGone:
                 log.warning("[%s] Client disconnected during peek", req_id)

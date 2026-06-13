@@ -58,6 +58,40 @@ def test_parse_model_route_cli_spec():
     assert route == ModelRoute("http://haiku:8000", "Qwen2.5")
 
 
+def test_template_family_defaults_to_auto():
+    config = ProxyConfig(
+        backend_url="http://default:8000",
+        model_routes={"claude-x": ModelRoute(backend_url="http://x:8000")},
+    )
+    assert config.resolve_backend("claude-x").template_family == "auto"
+    assert config.resolve_backend("unknown").template_family == "auto"
+
+
+def test_load_proxy_config_parses_template_family(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+backend_url = "http://default:8000"
+
+[model_routes."claude-opus-*"]
+backend_url = "http://opus:8000"
+upstream_model = "Kimi-K2.7-Code"
+template_family = "kimi"
+
+[model_routes."claude-sonnet-*"]
+backend_url = "http://sonnet:8000"
+template_family = "bogus"
+""",
+        encoding="utf-8",
+    )
+
+    config, _ = load_proxy_config(path)
+
+    assert config.resolve_backend("claude-opus-latest").template_family == "kimi"
+    # Invalid value falls back to the safe default.
+    assert config.resolve_backend("claude-sonnet-latest").template_family == "auto"
+
+
 def test_load_proxy_config_reads_toml_routes(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(

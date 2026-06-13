@@ -204,6 +204,7 @@ async def convert_openai_stream_to_anthropic(
                     yield _build_content_block_start(current_index, {
                         "type": "thinking",
                         "thinking": "",
+                        "signature": "",
                     })
                 yield _build_content_block_delta(current_index, {
                     "type": "thinking_delta",

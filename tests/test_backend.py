@@ -221,6 +221,252 @@ async def test_sampling_follows_resolved_model_not_first_served(monkeypatch):
     assert session.posts[0]["json"]["temperature"] == 0.9
 
 
+@pytest.mark.asyncio
+async def test_kimi_thinking_active_sends_kimi_kwargs(monkeypatch):
+    # Resolved model name contains "kimi" -> kimi family via auto-sniff.
+    _patch_detect(monkeypatch, _state("Kimi-K2.7-Code", ["Kimi-K2.7-Code"]))
+
+    session = FakeSession()
+    config = ProxyConfig(backend_url="http://default:8000")
+    # Pre-seed the DeepSeek-style kwargs/top-level keys convert_request would emit.
+    body = {
+        "model": "claude-opus",
+        "messages": [],
+        "stream": True,
+        "_thinking_active": True,
+        "reasoning": {"effort": "high", "enabled": True},
+        "enable_thinking": True,
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+            "clear_thinking": False,
+            "reasoning_effort": "high",
+        },
+    }
+
+    await send_to_backend(session, config, body)
+
+    sent = session.posts[0]["json"]
+    assert sent["chat_template_kwargs"] == {"thinking": True, "preserve_thinking": True}
+    # DeepSeek-only conversion fields stripped.
+    assert "reasoning" not in sent
+    assert "enable_thinking" not in sent
+    assert "_thinking_active" not in sent
+
+
+@pytest.mark.asyncio
+async def test_kimi_thinking_always_enabled_even_when_client_inactive(monkeypatch):
+    # Even when the client did NOT request thinking, Kimi keeps thinking=True:
+    # thinking=false would trigger the identity parser and leak raw reasoning
+    # into content. The proxy instead drops reasoning client-side via emit_thinking.
+    _patch_detect(monkeypatch, _state("Kimi-K2.6", ["Kimi-K2.6"]))
+
+    session = FakeSession()
+    config = ProxyConfig(backend_url="http://default:8000")
+    # No _thinking_active -> client inactive.
+    await send_to_backend(session, config, {"model": "claude-opus", "messages": []})
+
+    sent = session.posts[0]["json"]
+    assert sent["chat_template_kwargs"] == {"thinking": True, "preserve_thinking": True}
+
+
+@pytest.mark.asyncio
+async def test_kimi_reshapes_assistant_reasoning(monkeypatch):
+    _patch_detect(monkeypatch, _state("Kimi-K2.6", ["Kimi-K2.6"]))
+
+    session = FakeSession()
+    config = ProxyConfig(backend_url="http://default:8000")
+    body = {
+        "model": "claude-opus",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello",
+             "thinking": {"content": "step one", "signature": "sig"}},
+            {"role": "assistant",
+             "thinking": {"content": "step two", "signature": ""},
+             "tool_calls": [{"id": "t1", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+        ],
+        "_thinking_active": True,
+    }
+
+    await send_to_backend(session, config, body)
+
+    msgs = session.posts[0]["json"]["messages"]
+    # Nested thinking remapped to a flat reasoning_content string; thinking dropped.
+    assert msgs[1]["reasoning_content"] == "step one"
+    assert "thinking" not in msgs[1]
+    # Tool-call assistant turn reshaped too, tool_calls preserved.
+    assert msgs[2]["reasoning_content"] == "step two"
+    assert "thinking" not in msgs[2]
+    assert msgs[2]["tool_calls"][0]["id"] == "t1"
+    # Original body untouched (deepcopy).
+    assert body["messages"][1]["thinking"] == {"content": "step one", "signature": "sig"}
+
+
+@pytest.mark.asyncio
+async def test_kimi_reshape_keeps_existing_reasoning_content(monkeypatch):
+    _patch_detect(monkeypatch, _state("Kimi-K2.6", ["Kimi-K2.6"]))
+
+    session = FakeSession()
+    config = ProxyConfig(backend_url="http://default:8000")
+    body = {
+        "model": "claude-opus",
+        "messages": [
+            # A usable reasoning_content already present wins; nested thinking dropped.
+            {"role": "assistant", "reasoning_content": "kept",
+             "thinking": {"content": "ignored", "signature": "s"}},
+            # Empty existing reasoning_content is replaced by the thinking content.
+            {"role": "assistant", "reasoning_content": "",
+             "thinking": {"content": "from-thinking", "signature": "s"}},
+        ],
+        "_thinking_active": True,
+    }
+
+    await send_to_backend(session, config, body)
+
+    msgs = session.posts[0]["json"]["messages"]
+    assert msgs[0]["reasoning_content"] == "kept"
+    assert "thinking" not in msgs[0]
+    assert msgs[1]["reasoning_content"] == "from-thinking"
+    assert "thinking" not in msgs[1]
+
+
+@pytest.mark.asyncio
+async def test_template_family_kimi_override_forces_kimi(monkeypatch):
+    # Resolved name has no "kimi", but the route declares the family explicitly.
+    _patch_detect(monkeypatch, _state("DeepSeek-V4-Flash", ["DeepSeek-V4-Flash"]))
+
+    session = FakeSession()
+    config = ProxyConfig(
+        backend_url="http://default:8000",
+        model_routes={
+            "*opus*": ModelRoute(
+                backend_url="http://default:8000",
+                upstream_model="DeepSeek-V4-Flash",
+                template_family="kimi",
+            ),
+        },
+    )
+
+    await send_to_backend(session, config, {"model": "claude-opus-4-8", "messages": [], "_thinking_active": True})
+
+    assert session.posts[0]["json"]["chat_template_kwargs"] == {"thinking": True, "preserve_thinking": True}
+
+
+@pytest.mark.asyncio
+async def test_template_family_deepseek_override_forces_deepseek(monkeypatch):
+    # Resolved name contains "kimi", but the route forces the DeepSeek contract.
+    _patch_detect(monkeypatch, _state("Kimi-K2.6", ["Kimi-K2.6"]))
+
+    session = FakeSession()
+    config = ProxyConfig(
+        backend_url="http://default:8000",
+        model_routes={
+            "*opus*": ModelRoute(
+                backend_url="http://default:8000",
+                upstream_model="Kimi-K2.6",
+                template_family="deepseek",
+            ),
+        },
+    )
+    body = {
+        "model": "claude-opus-4-8",
+        "messages": [{"role": "assistant", "thinking": {"content": "x", "signature": "s"}}],
+        "_thinking_active": True,
+    }
+
+    await send_to_backend(session, config, body)
+
+    sent = session.posts[0]["json"]
+    kwargs = sent["chat_template_kwargs"]
+    # DeepSeek path: reasoning_effort + enable_thinking, no Kimi vars.
+    assert kwargs["reasoning_effort"] == "max"
+    assert kwargs["enable_thinking"] is True
+    assert "thinking" not in kwargs
+    assert "preserve_thinking" not in kwargs
+    # DeepSeek path does NOT reshape messages.
+    assert sent["messages"][0]["thinking"] == {"content": "x", "signature": "s"}
+    assert "reasoning_content" not in sent["messages"][0]
+
+
+@pytest.mark.asyncio
+async def test_resolved_deepseek_wins_over_stale_kimi_upstream(monkeypatch):
+    # Backend serves DeepSeek; route's upstream_model is a stale Kimi name that
+    # the backend does not serve, so resolution falls back to DeepSeek. The
+    # concrete resolved model must win -> DeepSeek path, NOT Kimi.
+    _patch_detect(monkeypatch, _state("DeepSeek-V4-Flash", ["DeepSeek-V4-Flash"]))
+
+    session = FakeSession()
+    config = ProxyConfig(
+        backend_url="http://default:8000",
+        model_routes={
+            "*opus*": ModelRoute(
+                backend_url="http://default:8000",
+                upstream_model="Kimi-K2.6",  # stale; not served
+            ),
+        },
+    )
+    body = {
+        "model": "claude-opus-4-8",
+        "messages": [{"role": "assistant", "thinking": {"content": "x", "signature": "s"}}],
+        "_thinking_active": True,
+    }
+
+    await send_to_backend(session, config, body)
+
+    sent = session.posts[0]["json"]
+    assert sent["model"] == "DeepSeek-V4-Flash"
+    # DeepSeek path: reasoning_effort set, no Kimi vars, nested thinking untouched.
+    assert sent["chat_template_kwargs"].get("reasoning_effort") == "max"
+    assert "thinking" not in sent["chat_template_kwargs"]
+    assert sent["messages"][0]["thinking"] == {"content": "x", "signature": "s"}
+
+
+@pytest.mark.asyncio
+async def test_kimi_upstream_used_only_when_resolution_unavailable(monkeypatch):
+    # Backend probe failed -> resolve_model yields "default". Fall back to the
+    # configured Kimi upstream_model so the Kimi path still fires.
+    _patch_detect(monkeypatch, _state("default", ["default"]))
+
+    session = FakeSession()
+    config = ProxyConfig(
+        backend_url="http://default:8000",
+        model_routes={
+            "*opus*": ModelRoute(
+                backend_url="http://default:8000",
+                upstream_model="Kimi-K2.6",
+            ),
+        },
+    )
+
+    await send_to_backend(session, config, {"model": "claude-opus-4-8", "messages": [], "_thinking_active": True})
+
+    assert session.posts[0]["json"]["chat_template_kwargs"] == {"thinking": True, "preserve_thinking": True}
+
+
+@pytest.mark.asyncio
+async def test_deepseek_thinking_active_regression(monkeypatch):
+    _patch_detect(monkeypatch, _state("DeepSeek-V4-Flash", ["DeepSeek-V4-Flash"]))
+
+    session = FakeSession()
+    config = ProxyConfig(
+        backend_url="http://default:8000",
+        model_routes={
+            "*opus*": ModelRoute(
+                backend_url="http://default:8000",
+                upstream_model="DeepSeek-V4-Flash",
+                reasoning_effort="high",
+            ),
+        },
+    )
+
+    await send_to_backend(session, config, {"model": "claude-opus-4-8", "messages": [], "_thinking_active": True})
+
+    kwargs = session.posts[0]["json"]["chat_template_kwargs"]
+    assert kwargs["reasoning_effort"] == "high"
+    assert kwargs["enable_thinking"] is True
+
+
 class _FakeGetResp:
     def __init__(self, payload):
         self._payload = payload

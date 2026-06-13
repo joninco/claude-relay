@@ -14,6 +14,7 @@ class ModelRoute:
     backend_url: str
     upstream_model: str | None = None
     reasoning_effort: str | None = None
+    template_family: str = "auto"  # auto | kimi | deepseek
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class BackendTarget:
     upstream_model: str | None = None
     route_name: str = "default"
     reasoning_effort: str | None = None
+    template_family: str = "auto"  # auto | kimi | deepseek
 
 
 @dataclass
@@ -59,12 +61,12 @@ class ProxyConfig:
         model_raw = (request_model or "auto").strip() or "auto"
         if model_raw in self.model_routes:
             route = self.model_routes[model_raw]
-            return BackendTarget(model_raw, route.backend_url, route.upstream_model, model_raw, route.reasoning_effort)
+            return BackendTarget(model_raw, route.backend_url, route.upstream_model, model_raw, route.reasoning_effort, route.template_family)
 
         model_lower = model_raw.lower()
         for pattern, route in self.model_routes.items():
             if _is_glob_pattern(pattern) and fnmatchcase(model_lower, pattern.lower()):
-                return BackendTarget(model_raw, route.backend_url, route.upstream_model, pattern, route.reasoning_effort)
+                return BackendTarget(model_raw, route.backend_url, route.upstream_model, pattern, route.reasoning_effort, route.template_family)
 
         return BackendTarget(model_raw, self.backend_url)
 
@@ -96,12 +98,21 @@ def _coerce_model_route(name: str, value: Any) -> ModelRoute:
         raise ValueError(f"model route {name!r} is missing backend_url")
 
     reasoning_effort = None
+    template_family = "auto"
     if isinstance(value, dict):
         re = value.get("reasoning_effort")
         if isinstance(re, str) and re.strip():
             reasoning_effort = re.strip()
+        tf = value.get("template_family")
+        if isinstance(tf, str) and tf.strip().lower() in ("auto", "kimi", "deepseek"):
+            template_family = tf.strip().lower()
 
-    return ModelRoute(backend_url=backend_url, upstream_model=upstream_model, reasoning_effort=reasoning_effort)
+    return ModelRoute(
+        backend_url=backend_url,
+        upstream_model=upstream_model,
+        reasoning_effort=reasoning_effort,
+        template_family=template_family,
+    )
 
 
 def parse_model_route(spec: str) -> tuple[str, ModelRoute]:

@@ -217,6 +217,16 @@ def test_tool_call_delta_is_visible_output():
     assert _delta_has_visible_output({"tool_calls": [{"index": 0}]})
 
 
+def test_reasoning_is_visible_when_thinking_enabled():
+    # When the client requested extended thinking, reasoning-only output is a
+    # valid (thinking-only) response, not an empty one to retry.
+    assert _delta_has_visible_output({"reasoning": "step"}, count_reasoning=True)
+    assert _delta_has_visible_output({"reasoning_content": "step"}, count_reasoning=True)
+    assert _delta_has_visible_output({"thinking": {"content": "step"}}, count_reasoning=True)
+    # Still empty if there is genuinely nothing.
+    assert not _delta_has_visible_output({"thinking": {"content": ""}}, count_reasoning=True)
+
+
 class _DummyResponse:
     async def write(self, chunk: bytes) -> None:
         pass
@@ -241,6 +251,25 @@ async def test_peek_buffers_reasoning_only_stream_until_done():
 
     assert not has_content
     assert [event.data for event in buffered][-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_peek_treats_reasoning_as_visible_when_thinking_enabled():
+    # With count_reasoning (client requested thinking), the peek breaks on the
+    # first reasoning delta and reports visible output — so a thinking-only
+    # completion is not misclassified as empty.
+    buffered, has_content = await _peek_with_keepalive(
+        _events([
+            '{"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}]}',
+            '{"choices":[{"delta":{"reasoning":"hidden"},"finish_reason":null}]}',
+            '{"choices":[{"delta":{},"finish_reason":"length"}]}',
+            '[DONE]',
+        ]),
+        _DummyResponse(),
+        count_reasoning=True,
+    )
+
+    assert has_content
 
 
 @pytest.mark.asyncio
