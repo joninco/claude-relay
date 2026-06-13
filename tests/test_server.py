@@ -10,6 +10,7 @@ from claude_relay.server import (
     _context_overflow_retry_from_error,
     _delta_has_visible_output,
     _peek_with_keepalive,
+    _should_use_image_agent,
 )
 from claude_relay.sse import SSEEvent
 
@@ -215,6 +216,39 @@ def test_text_content_is_visible_output():
 
 def test_tool_call_delta_is_visible_output():
     assert _delta_has_visible_output({"tool_calls": [{"index": 0}]})
+
+
+_IMG_BODY = {"messages": [{"role": "user", "content": [
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+]}]}
+_TEXT_BODY = {"messages": [{"role": "user", "content": "hello"}]}
+
+
+def test_image_agent_skipped_for_native_vision_kimi():
+    # Kimi sees images natively; never offload to a separate vision model.
+    cfg = ProxyConfig(image_agent_enabled=True, vision_url="http://vision:8000")
+    assert not _should_use_image_agent(cfg, _IMG_BODY, "kimi")
+
+
+def test_image_agent_used_for_text_only_backend_with_vision_model():
+    cfg = ProxyConfig(image_agent_enabled=True, vision_url="http://vision:8000")
+    assert _should_use_image_agent(cfg, _IMG_BODY, "deepseek")
+
+
+def test_image_agent_skipped_without_vision_url():
+    # No vision model configured -> the agent cannot work; pass images through.
+    cfg = ProxyConfig(image_agent_enabled=True, vision_url="")
+    assert not _should_use_image_agent(cfg, _IMG_BODY, "deepseek")
+
+
+def test_image_agent_skipped_when_disabled():
+    cfg = ProxyConfig(image_agent_enabled=False, vision_url="http://vision:8000")
+    assert not _should_use_image_agent(cfg, _IMG_BODY, "deepseek")
+
+
+def test_image_agent_skipped_without_images():
+    cfg = ProxyConfig(image_agent_enabled=True, vision_url="http://vision:8000")
+    assert not _should_use_image_agent(cfg, _TEXT_BODY, "deepseek")
 
 
 def test_reasoning_is_visible_when_thinking_enabled():

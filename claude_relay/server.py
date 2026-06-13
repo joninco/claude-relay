@@ -19,7 +19,7 @@ from .config import ProxyConfig
 from .convert_request import convert_request
 from .convert_stream import StreamResult, convert_openai_stream_to_anthropic
 from .sse import SSEEvent, make_anthropic_sse, parse_sse_stream
-from .backend import send_to_backend, detect_backend, get_state, get_states_info
+from .backend import send_to_backend, detect_backend, get_state, get_states_info, _template_family
 from .image_agent import has_images, strip_and_cache_images, image_agent_stream, ImageCache
 from .normalize import normalize_request
 
@@ -711,6 +711,23 @@ async def _debug_sse_stream(
             )
 
 
+def _should_use_image_agent(config: ProxyConfig, body: dict, backend_family: str) -> bool:
+    """Whether to route images through the separate-vision-model image agent.
+
+    The image agent strips images and offloads them to a standalone vision
+    model (config.vision_url); that only makes sense for a text-only backend.
+    Skip it when the backend has native vision (Kimi) or when no vision model
+    is configured — otherwise images would be taken away from a model that can
+    read them directly.
+    """
+    return (
+        config.image_agent_enabled
+        and has_images(body)
+        and bool(config.vision_url)
+        and backend_family != "kimi"
+    )
+
+
 async def handle_messages(request: web.Request) -> web.StreamResponse:
     config: ProxyConfig = request.app["config"]
     session: aiohttp.ClientSession = request.app["session"]
@@ -725,7 +742,17 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     # Session ID for image agent: use user_id if provided, otherwise req_id (not "default") to prevent collisions
     req_id = os.urandom(3).hex()
     session_id = (body.get("metadata") or {}).get("user_id", req_id)
-    use_image_agent = config.image_agent_enabled and has_images(body)
+
+    # Resolve the backend up front so the image-agent decision can see the
+    # target. image_agent offloads images to a SEPARATE vision model, which is
+    # only correct for a text-only backend. Skip it when the backend has native
+    # vision (Kimi) or when no vision model is configured — otherwise images
+    # would be stripped from a model that can read them directly.
+    backend_target = config.resolve_backend(str(body.get("model") or "auto"))
+    state = await detect_backend(session, backend_target.backend_url)
+    resolved_model = state.resolve_model(backend_target.upstream_model)
+    backend_family = _template_family(resolved_model, backend_target)
+    use_image_agent = _should_use_image_agent(config, body, backend_family)
 
     msgs = body.get("messages", [])
     num_tools = len(body.get("tools", []))
@@ -774,8 +801,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     openai_msgs = openai_body.get("messages", [])
     openai_tool_names = _openai_tool_names(openai_body.get("tools", []))
     tool_debug_enabled = config.tool_debug and bool(openai_tool_names)
-    backend_target = config.resolve_backend(str(openai_body.get("model") or "auto"))
-    state = await detect_backend(session, backend_target.backend_url)
+    # backend_target/state already resolved above for the image-agent gate.
     log.info(
         "[%s]     route: model=%s -> backend=%s route=%s upstream_model=%s",
         req_id,
