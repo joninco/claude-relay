@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, field, fields
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -7,6 +8,8 @@ try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     import tomli as tomllib
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -104,8 +107,15 @@ def _coerce_model_route(name: str, value: Any) -> ModelRoute:
         if isinstance(re, str) and re.strip():
             reasoning_effort = re.strip()
         tf = value.get("template_family")
-        if isinstance(tf, str) and tf.strip().lower() in ("auto", "kimi", "deepseek"):
-            template_family = tf.strip().lower()
+        if isinstance(tf, str) and tf.strip():
+            tf_norm = tf.strip().lower()
+            if tf_norm in ("auto", "kimi", "deepseek"):
+                template_family = tf_norm
+            else:
+                log.warning(
+                    "unknown template_family %r for route %r; using 'auto' "
+                    "(valid: auto, kimi, deepseek)", tf, name,
+                )
 
     return ModelRoute(
         backend_url=backend_url,

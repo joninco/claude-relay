@@ -1,5 +1,7 @@
 """Tests for proxy configuration and model routing."""
 
+import logging
+
 from claude_relay.config import ModelRoute, ProxyConfig, load_proxy_config, parse_model_route
 
 
@@ -67,7 +69,7 @@ def test_template_family_defaults_to_auto():
     assert config.resolve_backend("unknown").template_family == "auto"
 
 
-def test_load_proxy_config_parses_template_family(tmp_path):
+def test_load_proxy_config_parses_template_family(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text(
         """
@@ -85,11 +87,14 @@ template_family = "bogus"
         encoding="utf-8",
     )
 
-    config, _ = load_proxy_config(path)
+    with caplog.at_level(logging.WARNING):
+        config, _ = load_proxy_config(path)
 
     assert config.resolve_backend("claude-opus-latest").template_family == "kimi"
-    # Invalid value falls back to the safe default.
+    # Invalid value falls back to the safe default, with a warning.
     assert config.resolve_backend("claude-sonnet-latest").template_family == "auto"
+    assert "unknown template_family" in caplog.text
+    assert "bogus" in caplog.text
 
 
 def test_load_proxy_config_reads_toml_routes(tmp_path):
